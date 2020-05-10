@@ -1,0 +1,9 @@
+{
+    "version": "2.0.0",
+    "tasks": [{
+            "label": "echo",
+            "type": "shell",
+            "command": "gcc",
+            "args": ["-g", "/bin/main.cpp", "-o", "main.exe"]
+    }]
+}

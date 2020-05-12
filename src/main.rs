@@ -1,5 +1,6 @@
 extern crate iron;
 extern crate json;
+extern crate chrono;
 extern crate router;
 extern crate typed_html;
 #[macro_use]
@@ -8,10 +9,9 @@ extern crate mime;
 extern crate lazy_static;
 
 use iron::prelude::*;
-use iron::status;
-use iron::Iron;
+use iron::{status, Iron, method::Method};
 use std::sync::{mpsc, Arc, Mutex};
-use router::Router;
+use router::{Router};
 use std::collections::HashMap;
 use std::io::prelude::*;
 use std::fmt;
@@ -19,6 +19,7 @@ use std::time::{SystemTime, Duration};
 use std::thread;
 use chrono::offset::Utc;
 use chrono::DateTime;
+use std::rc::Rc;
 
 
 #[derive(Debug, Clone)]
@@ -37,6 +38,58 @@ impl Client
             host: _host,
             port: _port,
         }
+    }
+
+    fn _get_client_log(this: &Self, queues: HashMap<String, Arc<Mutex<Queue>>>, data_type: &str) -> json::JsonValue
+    {
+        let mut data:  Vec<json::JsonValue> = vec![];
+       
+        for (queue_name, q) in queues
+        {
+            if data_type != "msg"
+            {
+                match 
+                    if   data_type == "pub" { q.lock().unwrap().clone().publishers.iter().position( |user| user == this)  }
+                    else                    { q.lock().unwrap().clone().subscribers.iter().position(|user| user == this) }
+                    
+                {
+                    Some(_) => data.push(json::JsonValue::from(queue_name)),
+                    None    => (),
+                }
+            } else {
+                let msgs = q.lock().unwrap().clone().data.iter().filter(|meesage| meesage.sender == *this).cloned().collect::<Vec<MSG>>();
+
+                for message in msgs { data.push(json::JsonValue::from(message)); }
+            }
+        }
+
+        return json::JsonValue::from(data);
+    }
+
+    pub fn get_queue_where_client_publisher(this: &Self, queues: HashMap<String, Arc<Mutex<Queue>>>) -> json::JsonValue
+    {
+        Self::_get_client_log(this, queues, "pub")
+    }
+
+    pub fn get_queue_where_client_subscriber(this: &Self, queues: HashMap<String, Arc<Mutex<Queue>>>) -> json::JsonValue
+    {
+        Self::_get_client_log(this, queues, "sub")
+    }
+
+    pub fn get_client_messsages(this: &Self, queues: HashMap<String, Arc<Mutex<Queue>>>) -> json::JsonValue
+    {
+        Self::_get_client_log(this, queues, "msg")
+    }
+
+    pub fn get_my_data(this: &Self, queues: HashMap<String, Arc<Mutex<Queue>>>) -> json::JsonValue
+    {
+        let mut data: HashMap<String, json::JsonValue> = HashMap::new();
+
+        data.insert(String::from("publisher"),  Self::get_queue_where_client_publisher( this, queues.clone()));
+        data.insert(String::from("subscriber"), Self::get_queue_where_client_subscriber(this, queues.clone()));
+        data.insert(String::from("messages"),   Self::get_client_messsages(             this, queues.clone()));
+
+        return json::JsonValue::from(data);
     }
 }
 
@@ -278,10 +331,15 @@ impl ApplicationResponse for Response
 }
 
 
-lazy_static!
+#[derive(Clone)]
+enum Handler<'a>
 {
-    pub static ref QUEUES: Arc<Mutex<HashMap<String, Arc<Mutex<Queue>>>>> = Arc::new(Mutex::new(HashMap::new()));
+    Empty(            &'a dyn Fn()                        -> IronResult<Response>),
+    OnlyClient(       &'a dyn Fn(Client)                  -> IronResult<Response>),
+    ClientAndFormdata(&'a dyn Fn(Client, json::JsonValue) -> IronResult<Response>),
 }
+
+unsafe impl<'a> std::marker::Sync for Handler<'a> {}
 
 
 struct Server
@@ -290,22 +348,22 @@ struct Server
     port:   u64,
 }
 
-impl Server
+impl<'a> Server
 {
-    fn new (host:String, port: u64) -> Server
+    fn new (host:String, port: u64, _router: router::Router) -> Server
     {
-        Server 
-        {
-            host:   host, 
-            port:   port
-        }
+        let mut app = Server { host: host, port: port };
+
+        app.run(_router);
+
+        return app;
     }
 
-    fn is_formdata_not_valide(formdata: json::JsonValue, require_params: Vec<&str>) -> Option<String>
+    fn is_formdata_not_valide(formdata: json::JsonValue, require_params: Vec<String>) -> Option<String>
     {
         for param in &require_params
         {
-            if formdata[*param].is_null()
+            if formdata[&*param].is_null()
             {
                 return Some(format!(r#""{}" is require."#, param));
             }
@@ -314,7 +372,7 @@ impl Server
         return None;
     }
 
-    fn get_json_data(_request: &mut Request, require_params: Vec<&str>) -> Result<json::JsonValue, json::JsonValue>
+    fn get_json_data(_request: &mut Request, require_params: Vec<String>) -> Result<json::JsonValue, json::JsonValue>
     {
         let mut buffer = String::from("");
         
@@ -336,8 +394,53 @@ impl Server
             }
         }
     }
-    
-    fn queues_to_json() -> json::JsonValue
+
+    fn _handler(request: &mut Request, method: String, handler: Handler, require_params: Vec<String>) -> IronResult<Response>
+    {
+        let valide = if &*method != "get" && require_params.len() > 0 { Server::get_json_data(request, require_params) } else { Ok(json::object!{}) };
+        let client =  Client::new(format!("{}", request.remote_addr.ip()), request.remote_addr.port() as u64);
+
+        match valide
+        {
+            Ok(formdata) =>
+            {
+                match handler
+                {
+                    Handler::Empty(func)             => func(),
+                    Handler::OnlyClient(func)        => func(client),
+                    Handler::ClientAndFormdata(func) => func(client, formdata),
+                }
+            },
+            Err(txt) => Ok(Response::json(json::object!{"error" => format!("\"{}\"", txt)}, status::BadRequest)),
+        }
+    }
+
+    pub fn run(&mut self, _router: Router)
+    {
+        Iron::new(_router).http(format!("{}:{}", self.host, self.port)).unwrap();
+    }
+}
+
+
+mod qgatawey
+{
+    use super::*;
+
+    lazy_static!
+    {
+        pub static ref QUEUES: Arc<Mutex<HashMap<String, Arc<Mutex<Queue>>>>> = Arc::new(Mutex::new(HashMap::new()));
+    }
+
+    pub fn _json_response_finalize(rx: std::sync::mpsc::Receiver<Result<json::JsonValue, String>>) -> IronResult<Response> 
+    {
+        match rx.recv().unwrap()
+        {
+            Ok(queues) => Ok(Response::json(queues, status::Ok)),
+            Err(txt)   => Ok(Response::json(json::object!{"error" => txt}, status::BadRequest)),
+        }
+    }
+
+    pub fn queues_to_json() -> json::JsonValue
     {
         let mut data = json::object!{};
 
@@ -349,7 +452,12 @@ impl Server
         return data;
     }
 
-    fn queue_insert(queue: Queue) -> IronResult<Response>
+    pub fn get_user_log(client: Client) -> IronResult<Response>
+    {
+        Ok(Response::json(Client::get_my_data(&client, QUEUES.clone().lock().unwrap().clone()), status::Ok))
+    }
+
+    pub fn queue_insert(queue: Queue) -> IronResult<Response>
     {
         let (tr, rx) = mpsc::channel();
         
@@ -359,42 +467,27 @@ impl Server
             {
                 QUEUES.lock().unwrap().insert(queue.name.clone(), Arc::new(Mutex::new(queue)));
 
-                tr.send(Ok(Self::queues_to_json())).unwrap();
+                tr.send(Ok(queues_to_json())).unwrap();
             } else {
                 tr.send(Err(format!("\"{}\" allready exists", queue.name.clone()))).unwrap();
             }
         });
 
-        return Self::_json_response_finalize(rx);
+        return _json_response_finalize(rx);
     }
 
-    fn new_queue(request: &mut Request) -> IronResult<Response>
+    pub fn new_queue(client: Client, formdata: json::JsonValue) -> IronResult<Response>
     {
-        match Self::get_json_data(request, vec!["name"])
-        {
-            Err(error)   => Ok(Response::json(error, status::BadRequest)),
-            Ok(formdata) =>
-            {
-                let queue = Queue::new(format!("{}", formdata["name"]), Client::new(format!("{}", request.remote_addr.ip()), request.remote_addr.port() as u64));   
+        let queue = Queue::new(format!("{}", formdata["name"]), client);   
                 
-                return Self::queue_insert(queue);
-            }
-        }
+        return queue_insert(queue);
     }
 
-    fn _json_response_finalize(rx: std::sync::mpsc::Receiver<Result<json::JsonValue, String>>) -> IronResult<Response> 
+    fn _sub_or_unsub(client: Client, formdata: json::JsonValue, sub: bool) -> IronResult<Response>
     {
-        match rx.recv().unwrap()
-        {
-            Ok(queues) => Ok(Response::json(queues, status::Ok)),
-            Err(txt)   => Ok(Response::json(json::object!{"error" => txt}, status::BadRequest)),
-        }
-    }
+        let queue_name = format!("{}", formdata["name"]);
+        let (tr, rx)   = mpsc::channel();
 
-    fn queue_sub(queue_name: String, client: Client) -> IronResult<Response>
-    {
-        let (tr, rx) = mpsc::channel();
-        
         thread::spawn(move || {
                
             match QUEUES.lock().unwrap().get_mut(&*queue_name.clone())
@@ -403,7 +496,7 @@ impl Server
                 {
                     let mut queue = (**&q.lock().unwrap()).clone();
 
-                    match queue.sub(client)
+                    match if sub { queue.sub(client) } else { queue.unsub(client) }
                     {
                         Ok(qs) => 
                         {
@@ -417,14 +510,24 @@ impl Server
             }
         });
 
-        return Self::_json_response_finalize(rx);
+        return _json_response_finalize(rx);
     }
 
-    
-    fn queue_pub(queue_name: String, client: Client) -> IronResult<Response>
+    pub fn sub(client: Client, formdata: json::JsonValue) -> IronResult<Response>
     {
-        let (tr, rx) = mpsc::channel();
-        
+        _sub_or_unsub(client, formdata, true)
+    }
+
+    pub fn unsub(client: Client, formdata: json::JsonValue) -> IronResult<Response>
+    {
+        _sub_or_unsub(client, formdata, false)
+    }
+
+    fn _pub_or_unpub(client: Client, formdata: json::JsonValue, publ: bool) -> IronResult<Response>
+    {
+        let (tr, rx)   = mpsc::channel();
+        let queue_name = format!("{}", formdata["name"]);
+
         thread::spawn(move || {
                
             match QUEUES.lock().unwrap().get_mut(&*queue_name.clone())
@@ -433,7 +536,7 @@ impl Server
                 {
                     let mut queue = (**&q.lock().unwrap()).clone();
 
-                    match queue.add_publisher(client)
+                    match if publ { queue.add_publisher(client) } else { queue.remove_publisher(client) }
                     {
                         Ok(qs) => 
                         {
@@ -447,108 +550,23 @@ impl Server
             }
         });
 
-        return Self::_json_response_finalize(rx);
+        return _json_response_finalize(rx);
     }
 
-    fn queue_unsub(queue_name: String, client: Client) -> IronResult<Response>
+    pub fn _pub(client: Client, formdata: json::JsonValue) -> IronResult<Response>
+    {
+        _pub_or_unpub(client, formdata, true)
+    }
+
+    pub fn unpub(client: Client, formdata: json::JsonValue) -> IronResult<Response>
+    {
+        _pub_or_unpub(client, formdata, false)
+    }
+
+    pub fn push_in_queue(client: Client, formdata: json::JsonValue) -> IronResult<Response>
     {
         let (tr, rx) = mpsc::channel();
-        
-        thread::spawn(move || {
-               
-            match QUEUES.lock().unwrap().get_mut(&*queue_name.clone())
-            {
-                Some(q) =>
-                {
-                    let mut queue = (**&q.lock().unwrap()).clone();
 
-                    match queue.unsub(client)
-                    {
-                        Ok(qs) => 
-                        {
-                            *q = Arc::new(Mutex::new(queue.clone()));
-                            tr.send(Ok(json::JsonValue::from(qs))).unwrap()
-                        },
-                        Err(txt) => tr.send(Err(txt)).unwrap()
-                    }
-                },
-                None    => tr.send(Err(format!("\"{}\" not exists", &*queue_name.clone()))).unwrap(),
-            }
-        });
-
-        return Self::_json_response_finalize(rx);
-    }
-
-    fn queue_unpub(queue_name: String, client: Client) -> IronResult<Response>
-    {
-        let (tr, rx) = mpsc::channel();
-        
-        thread::spawn(move || {
-               
-            match QUEUES.lock().unwrap().get_mut(&*queue_name.clone())
-            {
-                Some(q) =>
-                {
-                    let mut queue = (**&q.lock().unwrap()).clone();
-
-                    match queue.remove_publisher(client)
-                    {
-                        Ok(qs) => 
-                        {
-                            *q = Arc::new(Mutex::new(queue.clone()));
-                            tr.send(Ok(json::JsonValue::from(qs))).unwrap()
-                        },
-                        Err(txt) => tr.send(Err(txt)).unwrap()
-                    }
-                },
-                None    => tr.send(Err(format!("\"{}\" not exists", &*queue_name.clone()))).unwrap(),
-            }
-        });
-
-        return Self::_json_response_finalize(rx);
-    }
-
-    fn request_analizator(request: &mut Request, reqiered_paras: Vec<&str>, callback: &dyn Fn(json::JsonValue)->IronResult<Response>) -> IronResult<Response>
-    {
-        match Self::get_json_data(request, reqiered_paras)
-        {
-            Err(error)   => Ok(Response::json(error, status::BadRequest)),
-            Ok(formdata) => callback(formdata),
-        }
-    }
-    
-    fn sub(request: &mut Request) -> IronResult<Response>
-    {
-        let client = Client::new(format!("{}", request.remote_addr.ip()), request.remote_addr.port() as u64);
-
-        Self::request_analizator(request, vec!["name"], &|formdata: json::JsonValue| Self::queue_sub(format!("{}", formdata["name"]), client.clone()))
-    }
-
-    fn unsub(request: &mut Request) -> IronResult<Response>
-    {
-        let client = Client::new(format!("{}", request.remote_addr.ip()), request.remote_addr.port() as u64);
-
-        Self::request_analizator(request, vec!["name"], &|formdata: json::JsonValue| Self::queue_unsub(format!("{}", formdata["name"]), client.clone()))
-    }
-
-    fn _pub(request: &mut Request) -> IronResult<Response>
-    {
-        let client = Client::new(format!("{}", request.remote_addr.ip()), request.remote_addr.port() as u64);
-
-        Self::request_analizator(request, vec!["name"], &|formdata: json::JsonValue| Self::queue_pub(format!("{}", formdata["name"]), client.clone()))
-    }
-
-    fn unpub(request: &mut Request) -> IronResult<Response>
-    {
-        let client = Client::new(format!("{}", request.remote_addr.ip()), request.remote_addr.port() as u64);
-
-        Self::request_analizator(request, vec!["name"], &|formdata: json::JsonValue| Self::queue_unpub(format!("{}", formdata["name"]), client.clone()))
-    }
-
-    fn _push_in_queue(formdata: json::JsonValue, client: Client) -> IronResult<Response>
-    {
-        let (tr, rx) = mpsc::channel();
-        
         thread::spawn(move || {
                
             match QUEUES.lock().unwrap().get_mut(&*format!("{}", formdata["name"]))
@@ -571,35 +589,63 @@ impl Server
             }
         });
 
-        return Self::_json_response_finalize(rx);
+        return _json_response_finalize(rx);
     }
 
-    fn push_in_queue(request: &mut Request) -> IronResult<Response>
+    pub fn full_map() -> IronResult<Response>
     {
-        let client = Client::new(format!("{}", request.remote_addr.ip()), request.remote_addr.port() as u64);
-
-        Self::request_analizator(request, vec!["name", "data"], &|formdata: json::JsonValue| Self::_push_in_queue(formdata, client.clone()))
+        return IronResult::Ok(Response::json(queues_to_json(), status::Ok));
     }
-
-    pub fn run(self)
-    {
-        let mut router = Router::new();
-
-        router.post("/new_queue", Self::new_queue,     "new_queue");
-        router.post("/sub",       Self::sub,           "sub");
-        router.post("/unsub",     Self::unsub,         "unsub");
-        router.post("/pub",       Self::_pub,          "pub");
-        router.post("/unpub",     Self::unpub,         "unpub");
-        router.post("/push",      Self::push_in_queue, "push");
-        router.get("/", |_: &mut Request| {IronResult::Ok(Response::json(Self::queues_to_json(), status::Ok))}, "full_map");
-        Iron::new(router).http(format!("{}:{}", self.host, self.port)).unwrap();
-    }   
 }
 
 
-fn main() 
+fn router_add_path(_router: &mut router::Router, path: &str, method: &str, handler: &'static Handler, require_params: Option<Vec<&str>>)
 {
-    let app = Server::new(String::from("localhost"), 1000);
+    let rp: Vec<String> = match require_params
+    {
+        Some(params) => params.iter().map(|el| format!("{}", el)).collect::<Vec<String>>(),
+        None         => Vec::new(),
+    };
+    let m = format!("{}", method.clone());
 
-    app.run();
+
+    if method == "post"
+    {
+        _router.post(path,   move |r: &mut Request| Server::_handler(r, m.clone(), handler.clone(), rp.clone()), path.clone());
+    } else if method == "put" {
+        _router.put(path,    move |r: &mut Request| Server::_handler(r, m.clone(), handler.clone(), rp.clone()), path.clone());
+    } else if method == "get" {
+        _router.get(path,    move |r: &mut Request| Server::_handler(r, m.clone(), handler.clone(), rp.clone()), path.clone());
+    } else if method == "delete" {
+        _router.delete(path, move |r: &mut Request| Server::_handler(r, m.clone(), handler.clone(), rp.clone()), path.clone());
+    } else {
+        _router.patch(path,  move |r: &mut Request| Server::_handler(r, m.clone(), handler.clone(), rp.clone()), path.clone());
+    }
+}
+
+
+mod config
+{
+    use super::*;
+
+    pub fn routes() -> router::Router
+    {
+        let mut _router = router::Router::new();
+
+        router_add_path(&mut _router, "/new_queue", "post", &Handler::ClientAndFormdata(&qgatawey::new_queue),     Some(vec!["name"]));
+        router_add_path(&mut _router, "/",          "get",  &Handler::Empty(            &qgatawey::full_map),      None);
+        router_add_path(&mut _router, "/sub",       "post", &Handler::ClientAndFormdata(&qgatawey::sub),           Some(vec!["name"]));
+        router_add_path(&mut _router, "/unsub",     "post", &Handler::ClientAndFormdata(&qgatawey::unsub),         Some(vec!["name"]));
+        router_add_path(&mut _router, "/pub",       "post", &Handler::ClientAndFormdata(&qgatawey::_pub),          Some(vec!["name"]));
+        router_add_path(&mut _router, "/unpub",     "post", &Handler::ClientAndFormdata(&qgatawey::unpub),         Some(vec!["name"]));
+        router_add_path(&mut _router, "/push",      "post", &Handler::ClientAndFormdata(&qgatawey::push_in_queue), Some(vec!["name", "data"]));
+        router_add_path(&mut _router, "/user_log",  "get",  &Handler::OnlyClient(       &qgatawey::get_user_log),  None);
+        
+        return _router;
+    }
+}
+
+fn main()
+{
+    Server::new(String::from("localhost"), 1000, config::routes());
 }
